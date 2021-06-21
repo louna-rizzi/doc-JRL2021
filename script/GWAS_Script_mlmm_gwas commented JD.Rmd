@@ -1,0 +1,540 @@
+---
+title: "GWAS JRL 2021"
+author: "J. David sur base d un script de Vincent Segura"
+date: "17/03/2021"
+output: 
+  rmdformats::downcute
+editor_options: 
+  chunk_output_type: console
+---
+
+# Contexte
+
+```{r setup, echo=TRUE, message=FALSE, results='hide', cache=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache.lazy = FALSE)
+
+#library("rstudioapi")   # mettre la directory en place
+#setwd(dirname(getActiveDocumentContext()$path)) # Set working directory to source file location
+#getwd()
+
+```
+
+```{r}
+rm(list = ls())
+
+library(anyLib)
+anyLib(c("data.table", "apercu", "mlmm.gwas", "corpcor","plyr"))
+library(stringr)
+
+```
+
+# JRL 
+Mettre ici le texte qui correspond à ce que vous avez fait 
+pourquoi  et comment
+quelles sont les variables
+
+
+# Introduction à la génétique d'association
+Il n'est pas question ici de faire un cours sur la génétique d'association mais d'en expliquer rapidement le principe et d'expliquer le script par étape. 
+La première étape est d'avoir obtenu sur les mêmes lignées des données phénotypiques et des données génotypiques sur un grand nombre de marqueurs, supposés représenter tous les morceaux de chromosomes dans lesquels gènes et marqueurs sont liés par le déséquilibre de liaison. 
+
+Pour simplifier, la valeur phénotypique est unique par lignée, elle a été obtenue dans une phase précédente qui a consisté à prendre en considération le plan d'expérience, les corrections spatiales éventuelles. Ce sont en général des BLUPS ou des BLUES.
+
+Les valeurs des phénotypes sont modélisés de la manière suivante
+
+$$Y=µ + X\beta + Zu + \epsilon$$
+où Y est un vecteur d'une colonne et de $L$ lignes qui porte les valeurs des phénotypes,  
+X est le vecteur qui donne le nombre de copies dans chaque lignée de l'allele de référence, mettons A, à un locus où on observe seulement deux allèles comme c'est le cas des marqueurs SNP. Donc X peut prendre comme valeur 2 si la lignée est AA à ce locus, 1 si elle est hétérozygote Aa et 0 si elle est aa.  
+$\beta$ est la pente de regression qui modifie le phénotype en fonction du nombre d'alléles A donné par X. L'effet génétique qui est modélisé est donc complètement additif.  Il est déclaré comme effet fixe. 
+C'est à dire que plus la lignée a de copies de A, plus son phénotype est modifié en proportion, en suivant la pente $\beta$. 
+Donc vous aurez compris que c'est la valeur de $\beta$ qui détermine si il y a une association entre le marqueur et le phénotype. Il faut donc faire autant d'analyses qu'il y a de marqueurs et tester la pvalue de la nullité de la pente de chacun des marqueurs. L'hypothèse nulle est $H_0 : \beta =0$. 
+  
+Z est une matrice de design qui attribue chaque valeur phénotypique à un effet multigénique pour chaque lignée. Cet effet, $u$ correspond à la somme de tous les  effets additifs des autres gènes polymorphes dans le génome et qui agissent sur le caractère. Ici elle est simple puisqu'il n'y a qu'une seule valeur Y pour chaque $u$.  
+$u$ est un vecteur qui donne les valeurs additives polygéniques pour chaque lignée. Comme les lignées ne sont pas indépendantes, elles peuvent être apparentées et donc leur $u$ ne sont pas indépendantes les unes des autres. Il faut donc prendre en compte le fait que posséder des allèles en commun va les faire se ressembler (leur valeur de Y sont corrélées). Donc $u$ est déclaré comme un effet aléatoire, suivant une loi normale de variance $2K\sigma_A^2$ où $\sigma_A^2$ est la variance additive polygénique du caractère et $K$ une matrice d'apparentemnt entre les lignées. K sera calculée avec les marqueurs.  
+$\epsilon$ est la résiduelle, aléatoire, de variance $\sigma^2$
+  
+Le script va donc effectuer les analyses pour tous les marqueurs et va même aller plus loin. Il va faire une analyse stepwise, en ajoutant les marqueurs qu'il a trouvé significatifs un par un, de manière successive (le plus significatif en premier) pour tester si l'ajout d'un marqueur $X_1$ permet de diminuer $\epsilon$.  
+
+$$Y=µ + X_1\beta_1 +  X\beta +  Zu + \epsilon_2$$
+
+Comme il y a eu de très nombreuses analyses (une par marqueur), il faut être prudent sur la valeur seuil des P-values pour décider si la pente $\beta$ d'un marqueur ne suit pas l'hypothèse nulle et que donc l'effet du marqueur est significatif et que nous sommes bien dans une zone QTL (quantitative trait locus). Rappelez-vous qu'avec un risque de 5% de première espèce de rejeter $H_o$ alors qu'elle est vraie fera qu'avec 100 000 marqueurs réellement indépendants, il y aura $5.10^5 10^{-2}= 5.10^3$ associations déclarées significatives alors qu'il n'y en a aucune.  
+Il faut donc prendre un risque plus faible pour controler pour les tests multiples. Si tous les marqueurs étaient indépedants, une solution serait d'appliquer une correction dite de Bonferroni, en divisant 5% par le nombre de marqueurs. Dans notre cas, le seuil devrait être de $5.10^{-7}$. Mais comme les marqueurs sont liés par haplotypes dans le génome, sans rentrer dans les détails, je vous propose de prendre $10^{-5}$ comme seuil de sécurité. Il correspond à une estimation du nombre de clusters indépendants dans la population EPO.
+
+# Passons à la pratique
+## les données sur le génotype
+### Positions des SNP sur les chromosomes
+
+Les marqueurs sont positionnés sur le génome du blé dur. Il faut donc charger le fichier des positions qui ont été obtenues de manière indirecte en blastant les séquences des marqueurs sur le génome entier. Il peut y avoir plusieurs endroits candidats. Donc attention à ne pas l'oublier. 
+
+```{r }
+# physical positions of SNP on the Zavitan WEW2 version
+load("../data/GENOTYPES/BREEDWHEAT_on_durum_physic_WEW2.Rdata")
+BLAST[1,]
+```
+
+Il y a 242382 SNP pour lesquels on a une position possible.
+```{r }
+dim(BLAST)
+```
+
+Ces SNPs sont caractérisés par de nombreuses propriétés qui seront utilisées plus tard.
+```{r }
+# toutes les infos dispo sur les snp
+load("../data/GENOTYPES/caract_SNP_ALL_PHYS.Rdata")
+
+```
+
+## Matrice de génotypage
+Les lignées ont été génotypées par une puce  à ADN sur laquelle on peut lire 420 000 SNP. Les données que nous allons utiliser font partie d'un projet plus large, il faut récupérer juste les données utiles. 
+
+```{r }
+# breed wheat genotypes
+file="../data/GENOTYPES/SG_EPO_complet.Rdata"
+load(file)
+
+dim(SG)
+```
+Il y a donc 476 lignées sur 168 725 SNP.
+
+On ne garde que ceux pour lesquels on a une position physique. Vous pourrez vérifier ensuite si vous auriez des associations avec des SNP dont vous n'avez pas idée de l'endroit où ils se trouvent. Il faudra changer le code qui suit dans ce cas. 
+
+```{r }
+# optional Keep sNP only with an assumed physical position
+liste<-which(colnames(SG) %in% BLAST[,1])
+length(liste)
+ap(liste)
+
+SG<-SG[,liste]
+dim(SG)
+
+```
+
+
+# Phenotypes 
+## Les données
+Ici il faudra placer vos propres données de BLUPs ou BLUE.
+
+```{r}
+#file<-"../data/PHENOTYPES/BLUP_example.csv"
+file<-"../data/PHENOTYPES/BlueBlupS2.csv"
+file<-"../data/PHENOTYPES/BlueBlupS1.csv"
+
+
+myY  <-read.table(file, head = TRUE, sep=";", dec=",")
+
+names(myY)[1]<-"Taxa"
+
+dim(myY)
+myY[1:10, 1]
+
+# a cause d'4line qui confond les 4 avec des A...
+myY[,1]<-str_replace(as.character(myY[,1]), "A", "4")
+
+```
+Attention à la manière dont les codes sont donnés. Il faut que ce soit codé comme dans le fichier de génotypes.
+## les relations entre les variables
+```{r}
+names(myY)
+pairs(myY[,c(2,3)])
+cor(myY[,c(2,3)])**2
+
+```
+Les BLUE et les BLUPS sont très corrélées à l'exception d'un point.
+
+
+# Keep Genotypes only if phenotyped
+```{r}
+SG<-SG[which(rownames(SG) %in% myY[,1]),]
+ap(SG)
+dim(SG)
+```
+Ici il reste 181 génotypes.
+Et attention aussi à ne pas garder de données phénotypiques pour lesquelles nous n'avons pas de données génotypiques. 
+
+```{r}
+# attention il y a des génotypes qui ne sont pas dans SG
+myY<-myY[which(myY[,1] %in% rownames(SG) ),]
+dim(myY)
+dim(SG)
+```
+Les deux nombres ici doivent être égaux.
+
+## Prétraitement des données 
+```{r}
+genot<-SG
+
+# il faut que genot soit une matrice
+class(genot)
+dim(genot)
+ap(genot)
+
+```
+
+
+### Imputation of Missing data 
+
+- simple binomial Imputation
+
+```{r na imp, cache = TRUE}
+
+noms<-rownames(genot)
+genot<-apply(genot,2,as.numeric)
+rownames(genot)<-noms
+
+genot.imp <- apply(genot, 2, function(x){
+  freq <- table(x)
+  x[is.na(x)] <- as.integer(names(which.max(freq)))
+  return(x)
+})
+
+```
+
+
+### Fréquence allélique minimale
+Il n'est pas raisonnable de faire une analyse si les fréquences alléliques sont trop déséquilibrées, par exemple un allèle très fréquent et l'autre très rare. Il y aurait un trop grand déséquilibre entre les effectifs des AA et des aa et la pente serait mal estimée, il pourrait y avoir des associations créées juste par quelques indididus au hasard. Donc on ne va garder que les marqueurs pour lesquels la fréquence de l'allèle minoritaire est plus grande qu'un certain seuil.
+
+Le calcul des fréquences est facile vus comment sont codés les génotypes. 
+```{r freqs}
+p <- colMeans(genot.imp) / 2
+q <- 1 - p
+```
+
+La répresentation du spectre de fréquences alléliques
+```{r maf, fig.height=4.5, fig.width = 5.5}
+maf <- apply(cbind(p, q), 1, min)
+hist(maf, col = "grey", main = "", breaks = 50, xlim = c(0, 0.5))
+```
+
+On voit sur cette figure que les alléles rares sont fréquents. 
+Ici on filtre de manière à ne garder que des MAF supérieures à 5%.
+
+```{r maf filter}
+sum(maf < 0.5)
+genot.ok <- genot.imp[, maf >= 0.05]
+dim(genot.ok)
+```
+Il ne reste plus que 65405 marqueurs dans cet exemple.
+
+### Physical map
+Une opération importante est de créer le fichier de la carte physique.
+```{r import map}
+map<-BLAST[which(BLAST[,1] %in% colnames(genot.ok)),c(1,2,6)]
+names(map)<-c("SNP","Chr","Pos")
+head(map)
+
+```
+
+on ne garde que les SNP sélectionnés et on renomme les chromosomes de 1 à 14.
+
+```{r map filter}
+map <- map[map$SNP %in% colnames(genot.ok), ]
+
+map[,2] <-mapvalues(map[,2], from=c( "chrom", 
+                          "chr1A", "chr1B", "chr2A", "chr2B",
+                          "chr3A", "chr3B", "chr4A", "chr4B",
+                          "chr5A", "chr5B", "chr6A", "chr6B",
+                          "chr7A", "chr7B")
+          , to=c("chrom", 1:14))
+
+map[,2]<-as.numeric(map[,2])
+
+dim(map)
+head(map)
+tail(map)
+```
+
+On les trie dans l'ordre des chromosomes et de leur positions en bp depuis le télomère du bras court.
+```{r map sort}
+map <- map[order(map$Pos), ]
+map <- map[order(map$Chr), ]
+head(map)
+tail(map)
+
+```
+
+On peut libérer de la place mémoire. 
+```{r clean genot}
+
+rm(genot, genot.imp, maf, p, q)
+
+```
+
+
+# Choix de la variable à analyser
+
+La variable importante est placée dans la variable y qui sera ensuite manipulée. 
+
+
+## Exploration des relations
+Ici il n'y a qu'une variable, c'est le numéro 2 (la première est le nom de la lignée)
+```{r}
+names(myY)
+
+# BLUP i<-2
+# BLUE i<-3
+i<-2
+
+```
+
+## préparation du vecteur phénotype
+```{r import phenot}
+hist(myY[,i], main = names(myY)[i])
+
+y <- myY[,i]
+
+# passage des noms dans le rowname de y
+names(y) <- myY$Taxa
+
+```
+
+```{r phenot hist, fig.height=4.5, fig.width=5.5}
+
+hist(y, col = "grey",  nclass=20, xlab = "BLUP Pucerons parasités", main=paste("Distribution of", names(myY)[i]))
+
+summary(y)
+
+```
+
+BLUP 
+Il y a des individus extrêmes ?  au dessus de 2 ? 
+Faut-il les enlever pour tester la robustesse ?
+
+BLUE 
+il y a un BLUE au dessus de 10... Il se peut qu'il ait un très fort effet
+
+# Data merge and viz
+
+## Data check 
+
+```{r plot match, fig.height=4.5, fig.width = 4.5}
+# tri des genotypes pour qu'il soient dans le meme ordre
+genot.ok<-genot.ok[order(rownames(genot.ok)),]
+y<-y[order(names(y))]
+
+genot.loop<-genot.ok
+
+# Comme il peut y avoir des données phénotypiques manquantes
+if (length(which(is.na(y)))>0 ) { 
+     liste<- which(is.na(y))
+     y <- y[-liste] 
+     genot.loop<-genot.loop[-liste,]
+     #rownames(genot.loop)<-rownames(genot.ok)[-which(is.na(y))]
+     }
+
+dim(genot.loop)
+```
+
+On verifie que les deux fichiers sont dans le meme ordre et qu'il y en a autant, ca doit faire une droite
+
+```{r plot match2, fig.height=4.5, fig.width = 4.5}
+plot(match(rownames(genot.loop), names(y)))
+
+# tri des marqueurs pour qu'ils soient dans l'ordre de la carte
+# ne pas le faire pour avoir tous les marqueurs
+genot.loop<-genot.loop[,map$SNP]
+plot(match(map$SNP, colnames(genot.loop)))
+```
+
+## Calcul de la matrice de Kinship
+
+### K Van Raden
+
+Il s'agit du calcul de la matrice d'apparentement du modèle. Il y a beaucoup de littérature sur la meilleure méthode de calcul de cette matrice. ici on utilise une méthode dite de Van Raden, pas expliquée ici.
+
+```{r , fig.height=4.5, fig.width = 4.5}
+# Calcul de la matrice d'apparentement
+p <- colMeans(genot.loop) / 2
+q <- 1 - p
+
+# Ici ca sera une Van Raden centrée
+genot.scaled <- scale(genot.loop, center = 2 * p, scale = sqrt(2 * p * q))
+
+K <- tcrossprod(genot.scaled) / ncol(genot.scaled)
+K <- make.positive.definite(K)
+```
+C'est une matrice carrée qui donne les relations deux à deux pour toutes les lignées. ici elle est 
+
+```{r}
+dim(K)
+```
+
+Voilà la distribution de toutes les valeurs. La plupart des lignées ont un très faible apparentement. 
+
+```{r , fig.height=4.5, fig.width = 4.5}
+hist(K)
+```
+
+# La régression 
+On prend une approche de regression multiple proposée par V.Segura et collaborateurs en utilisant le package mlmm.gwas. Mais il y a eu de très nombreuses variantes.  
+
+## Utilisation de mlmm.gwas
+
+Vous reconnaitrez dans l'appel de la fonction  
+**mlmm_allmodels(y, list(genot.scaled), list(K), maxsteps = 4, threshold=1e-5)**
+les différents membres du modèle.
+y le phénotype à analyser, K la matrice de Kinship, genot.scaled la matrice de tous les X, 
+Cette fonction va donc calculer en une seule fois toutes les pvalues de tous les marqueurs. 
+Elle va aussi utiliser un niveau de risque controlé pour les tests multiples avec threshold (vous pouvez le changer) 
+maxsteps donne le nombre de co facteurs (marqueurs les plus significatifs) qu'il va entrer  
+
+```{r}
+# dapres https://cran.r-project.org/web/packages/mlmm.gwas/vignettes/gwas-manual.html
+
+# dans mlmm.gwas la matrice des genotypes doit etre centrée (c'est pas écrit qu'elle doit être reduite ? ) 
+genot.scaled <- scale(genot.loop, center = 2 * p) 
+
+mygwas.gwas <- mlmm_allmodels(y, list(genot.scaled), list(K), 
+                               maxsteps = 4, threshold=1e-5)
+
+res_mlmm <- mygwas.gwas
+```
+
+Les pValues ont été calculées selon les 4 modèles et pour tous les marqueurs. L'exploitation des résultats n'est pas des plus faciles...
+
+Pour commencer,un graphe des -log10(Pvalues) pour tous les marqueurs, quelquesoit leur position. Est ce qu'il y en a qui dépassent le seuil ? 
+```{r}
+# manhattab plot sans carte
+manhattan.plot(res_mlmm)
+```
+
+Ensuite il y a une procédure (complexe) de choix du meilleur modèle.
+```{r}
+# Selection du modèle
+sel_XX = frommlmm_toebic(list(genot.scaled), res_mlmm)
+res_eBIC = eBIC_allmodels(y, sel_XX, list(K), ncol(genot.scaled))
+
+res_eBIC
+```
+Le meilleur modèle est celui qui a le plus petit eBIC.
+
+Avec les BLUPS le modèle avec le marqueur AX-89312681 a le eBIC le plus petit, il est donc significatif
+
+Avec les BLUES le modèle avec le marqueur AX-89312681 est à peine différent (il est même plus petit que le modèle sans marqueur) mais c'est bien le même marqueur
+
+On augmente un peu le risque de première espèce. 
+```{r}
+res_threshold <- threshold_allmodels(threshold=1e-4, res_mlmm)
+```
+Il y a un bug dans la sortie de la fonction apparemment quand ce sont les BLUE.. bizarre
+
+Mais c'est bien le SNP AX-89312681 qui est le premier dans les deux cas. 
+
+```{r}
+res_threshold
+
+```
+
+## pour comparer les pvalues
+```{r}
+# recupere les Pvalues d'un des itérations , la 2 est la naive
+iter<-2
+PVal_2<-res_mlmm[[iter]]
+length(PVal_2)
+SNP_Peak<-which(PVal_2==min(PVal_2))
+PVal_2[SNP_Peak]
+
+# any SNP
+PVal_2["AX-89312681"]
+
+```
+
+
+## Manhattan plot
+
+On peut maintenant regarder comment se distribuent les pvalues sur le génome physique.
+```{r}
+mip<-map
+mip$Chr<-sprintf("%2d",mip$Chr)
+
+manhattan.plot(res_mlmm, map = mip, steps = 2, hideCofactors = FALSE, chrToPlot = "all", unit = "bp")
+```
+
+il a un pic sur le Chr1B et un sur le 7B.
+
+
+# visualisation des effets
+
+On peut aussi calculer les effets alléliques (la valeur de la pente) 
+```{r}
+sel_XXclass = fromeBICtoEstimation(sel_XX, res_eBIC, res_threshold)
+
+effects = Estimation_allmodels(y, sel_XXclass, list(K))
+effects
+```
+
+Ici au locus AX-89312681, le génotype 00(aa) a une différence de 0.9232 momie par rapport au  génotype 11 (AA).
+
+Voilà son nom.
+```{r}
+mark_list<-names(sel_XXclass)
+mark_list[1]
+```
+
+Graphiquement, 
+```{r}
+# m numero du marqueur dans la liste des retenus
+m<-1
+genotypes.boxplot(genot.scaled, y , mark_list[m], effects)
+```
+
+Sans les htz pour la prise de mesure 1
+```{r}
+table(genot.loop[,mark_list[m]])
+
+boxplot(y~genot.loop[,mark_list[m]])
+summary(lm(y~genot.loop[,mark_list[m]]))
+
+liste<-which(genot.loop[,mark_list[m]]!=1)
+G<-genot.loop[liste,mark_list[m]]
+yy<-y[liste]
+
+boxplot(yy~G)
+summary(lm(yy~G))
+
+
+```
+
+Enfin il est souvent intéressant de savoir quels sont les effectifs de chaque classe.
+```{r}
+# les effectifs 
+table(genot.loop[,mark_list[m]])
+
+```
+
+Ca veut dire que l'allèle qui a "le plus de momies" est assez rare, il n'y a que 10 individus qui le portent tandis que la grande majorité ont l'allèle avec peu de momies. 
+
+
+Où est-il ?
+
+On utilise les données connues de position
+
+```{r}
+map[which(map$SNP == mark_list[m]),]
+
+```
+
+A t il des marqueurs proches qui sont liés aussi ? 
+
+##  En DL ?
+
+
+```{r}
+C<-cor(genot.ok[,mark_list[m]], genot.ok)**2
+
+liste<-which(C>0.8)
+liste<-colnames(C)[liste]
+
+liste<-map[which(map$SNP %in% liste),]
+liste
+```
+
+
+## est ce que les locus proches ont un effet ?
+```{r}
+genotypes.boxplot(genot.scaled, y , liste[2,1], effects)
+
+```
+oui c'est presque le meme ...
+Vous pouvez explorer
+
+

@@ -1,0 +1,4 @@
+Nam of the column;Unit;Meaning 
+EPO;/;Name of the wheat genotype
+blup;/;Best linear unbiased predictors (BLUPs) calculated from two replication data for each of the 180 genotypes and linked with spatial location with R-studio. 
+blue;/;Best linear unbiased estimators (BLUEs) calculated from two replication data for each of the 180 genotypes and linked with spatial location with R-studio. 
